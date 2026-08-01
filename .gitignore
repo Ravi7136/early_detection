@@ -25,8 +25,10 @@ Desktop.ini
 
 # Generated outputs / local data
 cold_room_detection.png
+cold_room_story.html
 sensor_sample_data.csv
 data_pics/
+data/
 generate_sample_data.py
 
 # Logs / temp
