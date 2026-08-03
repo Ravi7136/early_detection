@@ -1,0 +1,13 @@
+For cold room Exit detection, unlike Entry detection, we need to consider two criteria.
+
+Step 1 If the BLE_DESCRIPTION is OFFLINE_WITH_LOCATION, it indicates that the package has left the cold room, even if you do not observe a gradual temperature increase. This happens because the operations team may move the package away within a minute, causing the device to go out of range of the wireless access points. As a result, the device stops reporting temperature data, so no temperature spike is observed. This is the most common exit scenario. In most cases, you will see an OFFLINE_WITH_LOCATION event without a corresponding temperature spike. For example, in the attached screenshot, the package left the cold room at 1430, and the BLE_DESCRIPTION changed to OFFLINE_WITH_LOCATION, but no temperature spike was recorded.
+
+Step 2 If there is no OFFLINE_WITH_LOCATION event, then check for a gradual temperature increase to confirm the package exit. The logic should give highest priority to Step 1. Only if Step 1 is not satisfied should Step 2 be executed.
+
+refer screenshot for sample data at the end of the actual data with BLE_DESCRIPTION for each record.
+
+
+Understood — Step 1 (OFFLINE_WITH_LOCATION → immediate exit) takes priority; Step 2 (CUSUM warming) is the fallback. Implementing now:
+
+Add BLE_DESCRIPTION to the sample data (with OFFLINE_WITH_LOCATION at 14:30 like your screenshot)
+Extend the detector with the two-step exit logic

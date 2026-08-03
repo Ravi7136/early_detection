@@ -10,8 +10,15 @@ sensor event at a time and never looks ahead. It works on partial data:
     ARMED     - runs a one-sided (lower) CUSUM on temperature plus
                 proximity (txPower/RSSI path loss towards cold-room WAPs)
                 and rate-of-change confirmation. Fires ONE alert on entry.
-    IN_COLD_ROOM - suppresses further alerts until the temperature
-                recovers towards baseline (exit), then re-arms.
+    IN_COLD_ROOM - watches for EXIT with two prioritised criteria:
+        Step 1 (priority): BLE_DESCRIPTION == OFFLINE_WITH_LOCATION means the
+                package left WAP range - immediate EXIT alert, no temperature
+                rise needed (most common: ops move the package away quickly).
+        Step 2 (fallback): a fresh cold baseline is learned once the
+                temperature settles, then an upper-sided CUSUM detects a
+                sustained temperature RISE (gradual exit still in range).
+    After an EXIT alert the detector returns to LEARNING and can catch a
+    re-entry as a fresh event.
 
 Stream robustness:
     - out-of-order / stale events are dropped
@@ -49,8 +56,9 @@ PROX_WINDOW = timedelta(minutes=15)   # proximity evidence window
 COLD_SHARE_MIN = 0.5            # >=50% recent events heard by cold-room WAPs
 ROC_WINDOW = timedelta(minutes=10)    # rate-of-change confirmation window
 ROC_MIN_DROP = 0.5              # deg C fall inside ROC_WINDOW
-EXIT_MARGIN_SIGMA = 2.0         # recovery above mu0 - 2*sigma => exited
 MAD_TO_SIGMA = 1.4826           # robust sigma = MAD * 1.4826
+MIN_TEMP_RISE = 3.0             # deg C above cold baseline required for exit
+OFFLINE_DESC = "OFFLINE_WITH_LOCATION"   # step-1 exit signal
 
 
 def is_cold_room_wap(name: str) -> bool:
@@ -63,6 +71,7 @@ class SensorEvent:
     hw: str
     temp: float
     path_loss: Optional[float]   # median txPOWER - rssi over valid pairs (dB)
+    ble: str = ""                # BLE_DESCRIPTION lifecycle label
 
     @classmethod
     def from_record(cls, rec: dict) -> "SensorEvent":
@@ -79,6 +88,7 @@ class SensorEvent:
             hw=rec["HARDWARENAME"],
             temp=float(rec["IDNODECHIPTEMPARATURE"]),
             path_loss=statistics.median(pairs) if pairs else None,
+            ble=str(rec.get("BLE_DESCRIPTION", "")).strip(),
         )
 
 
@@ -93,6 +103,20 @@ class ColdRoomDetector:
         self.mu0 = self.sigma = self.k = self.h = None
         self.s_lo = 0.0
         self.recent: deque = deque()        # (ts, temp, hw, path_loss)
+        # exit (step 2) - cold baseline + upper CUSUM
+        self.cold_buf: deque = deque(maxlen=BASELINE_SAMPLES)
+        self.mu_cold = self.sigma_cold = self.k_cold = self.h_cold = None
+        self.s_hi = 0.0
+
+    def _reset_after_exit(self):
+        """Back to LEARNING so a re-entry is detected as a fresh event."""
+        self.state = "LEARNING"
+        self.baseline_buf.clear()
+        self.mu0 = self.sigma = self.k = self.h = None
+        self.s_lo = 0.0
+        self.cold_buf.clear()
+        self.mu_cold = self.sigma_cold = self.k_cold = self.h_cold = None
+        self.s_hi = 0.0
 
     # ---------- internals ----------
     def _prune(self, now: datetime):
@@ -129,6 +153,24 @@ class ColdRoomDetector:
         past = [t for ts, t, _, _ in self.recent if now - ts <= ROC_WINDOW]
         return bool(past) and max(past) - temp >= ROC_MIN_DROP
 
+    def _roc_rising(self, now: datetime, temp: float) -> bool:
+        past = [t for ts, t, _, _ in self.recent if now - ts <= ROC_WINDOW]
+        return bool(past) and temp - min(past) >= ROC_MIN_DROP
+
+    def _try_arm_exit(self):
+        temps = [t for _, t in self.cold_buf]
+        if len(temps) < BASELINE_SAMPLES:
+            return
+        if max(temps) - min(temps) > BASELINE_STABLE_RANGE:
+            return
+        self.mu_cold = statistics.mean(temps)
+        med = statistics.median(temps)
+        mad = statistics.median(abs(t - med) for t in temps)
+        self.sigma_cold = max(mad * MAD_TO_SIGMA, SIGMA_FLOOR)
+        self.k_cold = K_FACTOR * self.sigma_cold
+        self.h_cold = H_FACTOR * self.sigma_cold
+        self.s_hi = 0.0
+
     # ---------- public API ----------
     def update(self, ev: SensorEvent) -> Optional[dict]:
         # drop stale / out-of-order events
@@ -145,40 +187,80 @@ class ColdRoomDetector:
 
         elif self.state == "ARMED":
             self.s_lo = min(0.0, self.s_lo + (ev.temp - self.mu0 + self.k))
-            prox_ok, share, pl_now = self._proximity_ok(ev.ts)
-            if (self.s_lo < -self.h and prox_ok
+            # proximity is context for the ops team, not a blocking gate
+            # (gating on it delays detection right after entry, when the
+            # proximity window is still full of pre-entry room-WAP events)
+            _, share, pl_now = self._proximity_ok(ev.ts)
+            if (self.s_lo < -self.h
                     and ev.temp <= self.mu0 - MIN_TEMP_DROP
                     and self._roc_ok(ev.ts, ev.temp)):
                 self.state = "IN_COLD_ROOM"
                 alert = {
+                    "type": "ENTRY", "reason": "sustained temperature drop (CUSUM)",
                     "ts": ev.ts, "temp": ev.temp, "baseline": self.mu0,
                     "cusum": self.s_lo, "threshold": -self.h,
                     "cold_share": share, "path_loss": pl_now, "hw": ev.hw,
                 }
 
         elif self.state == "IN_COLD_ROOM":
-            if ev.temp > self.mu0 - EXIT_MARGIN_SIGMA * self.sigma:
-                self.state = "ARMED"        # package left the cold room
-                self.s_lo = 0.0
+            # ---- STEP 1 (priority): device went out of WAP range ----
+            if ev.ble == OFFLINE_DESC:
+                alert = {
+                    "type": "EXIT",
+                    "reason": "OFFLINE_WITH_LOCATION - package out of WAP range",
+                    "ts": ev.ts, "temp": ev.temp, "baseline": self.mu_cold,
+                    "hw": ev.hw,
+                }
+                self._reset_after_exit()
+            else:
+                # ---- STEP 2 (fallback): sustained temperature RISE ----
+                if self.mu_cold is None:
+                    self.cold_buf.append((ev.ts, ev.temp))
+                    self._try_arm_exit()
+                else:
+                    self.s_hi = max(0.0, self.s_hi +
+                                    (ev.temp - self.mu_cold - self.k_cold))
+                    if (self.s_hi > self.h_cold
+                            and ev.temp >= self.mu_cold + MIN_TEMP_RISE
+                            and self._roc_rising(ev.ts, ev.temp)):
+                        alert = {
+                            "type": "EXIT",
+                            "reason": "sustained temperature rise (CUSUM)",
+                            "ts": ev.ts, "temp": ev.temp, "baseline": self.mu_cold,
+                            "cusum": self.s_hi, "threshold": self.h_cold,
+                            "hw": ev.hw,
+                        }
+                        self._reset_after_exit()
 
         self.recent.append((ev.ts, ev.temp, ev.hw, ev.path_loss))
         return alert
 
 
 def format_alert(a: dict) -> str:
+    action = ("verify package is intended for cold storage."
+              if a["type"] == "ENTRY" else
+              "verify package removal from cold storage was intended.")
     lines = [
         "=" * 68,
-        "EARLY WARNING ALERT - potential cold-room entry",
+        f"EARLY WARNING ALERT - cold-room {a['type']}",
+        f"  Reason          : {a['reason']}",
         f"  Time            : {a['ts']:%d-%m-%Y %H:%M}",
-        f"  Temperature     : {a['temp']:.1f} C  (baseline {a['baseline']:.1f} C)",
-        f"  CUSUM statistic : {a['cusum']:.2f}  (threshold {a['threshold']:.2f})",
-        f"  Cold-WAP share  : {a['cold_share']:.0%} of proximity window",
     ]
-    if a["path_loss"] is not None:
+    if a.get("baseline") is not None:
+        lines.append(f"  Temperature     : {a['temp']:.1f} C  "
+                     f"(baseline {a['baseline']:.1f} C)")
+    else:
+        lines.append(f"  Temperature     : {a['temp']:.1f} C")
+    if a.get("cusum") is not None:
+        lines.append(f"  CUSUM statistic : {a['cusum']:.2f}  "
+                     f"(threshold {a['threshold']:.2f})")
+    if a.get("cold_share") is not None:
+        lines.append(f"  Cold-WAP share  : {a['cold_share']:.0%} of proximity window")
+    if a.get("path_loss") is not None:
         lines.append(f"  Path loss (cold): {a['path_loss']:.1f} dB (lower = closer)")
     lines += [
         f"  Receiving WAP   : {a['hw']}",
-        "  ACTION: notify operations - verify package is intended for cold storage.",
+        f"  ACTION: notify operations - {action}",
         "=" * 68,
     ]
     return "\n".join(lines)
@@ -207,9 +289,6 @@ def replay_stream(csv_path: str, speedup: Optional[float]):
             if alert:
                 n_alerts += 1
                 print(format_alert(alert))
-            if detector.state == "ARMED" and alert is None and armed_at \
-                    and ev.temp > detector.mu0 - EXIT_MARGIN_SIGMA * detector.sigma:
-                pass  # normal armed operation - stay quiet
 
     print(f"\nStream ended: {n_alerts} alert(s). Final state: {detector.state}")
 
